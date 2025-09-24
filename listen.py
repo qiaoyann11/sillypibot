@@ -24,10 +24,13 @@ LEFT_ENCODER = 26
 RIGHT_ENCODER = 16
 
 # PID Constants (default values, will be overridden by client)
-KP_turn, KI_turn, KD_turn = 0.0, 0.0, 0.0
 use_PID = 0
-KP, Ki, KD = 0, 0, 0
+KP, KI, KD = 0, 0, 0
 MAX_CORRECTION = 30  # Maximum PWM correction value
+
+# PID for turning
+use_PID_turn = 0
+KP_turn, KI_turn, KD_turn = 0, 0, 0
 
 # Global variables
 running = True
@@ -156,9 +159,16 @@ def apply_min_threshold(pwm_value, min_threshold):
 
 def pid_control():
     # Only applies for forward/backward, not turning
-    global left_pwm, right_pwm, left_count, right_count, use_PID, KP, KI, KD, KP_turn, KI_turn, KD_turn, prev_movement, current_movement    
-    integral = 0
-    last_error = 0
+    global left_pwm, right_pwm, left_count, right_count, use_PID, KP, KI, KD, use_PID_turn, KP_turn, KI_turn, KD_turn, prev_movement, current_movement
+    
+    # Forward/backward PID state
+    integral_fb = 0
+    last_error_fb = 0
+
+    # Turning PID state
+    integral_turn = 0
+    last_error_turn = 0
+
     last_time = monotonic()
     
     # Ramping variables & params
@@ -177,6 +187,14 @@ def pid_control():
         elif (left_pwm < 0 and right_pwm < 0): current_movement = 'backward'
         elif (left_pwm == 0 and right_pwm == 0): current_movement = 'stop'
         else: current_movement = 'turn'
+
+        if prev_movement != current_movement:
+            if current_movement in ['forward', 'backward']:
+                integral_fb, last_error_fb = 0, 0
+            elif current_movement == 'turn':
+                integral_turn, last_error_turn = 0, 0
+            reset_encoder()
+
         
         if not use_PID:
             target_left_pwm = left_pwm
@@ -186,52 +204,44 @@ def pid_control():
                 
                 error = left_count - right_count
                 proportional = KP * error
-                integral += KI * error * dt
-                integral = max(-MAX_CORRECTION, min(integral, MAX_CORRECTION))  # Anti-windup
-                derivative = KD * (error - last_error) / dt if dt > 0 else 0
-                correction = proportional + integral + derivative
+                integral_fb += KI * error * dt
+                integral_fb = max(-MAX_CORRECTION, min(integral_fb, MAX_CORRECTION))
+                derivative = KD * (error - last_error_fb) / dt if dt > 0 else 0
+
+                correction = proportional + integral_fb + derivative
                 correction = max(-MAX_CORRECTION, min(correction, MAX_CORRECTION))
-                last_error = error
+                last_error_fb = error
+
                             
                 if current_movement == 'backward':
                     correction = -correction
 
                 target_left_pwm = left_pwm - correction
-                target_right_pwm = right_pwm + correction  
-            elif current_movement == 'turn':
-                # PID for turning (based on encoder counts)
-                error = left_count - right_count  # Using encoder count difference for turning
-                
-                # PID control for turning
-                proportional = KP_turn * error
-                integral += KI_turn * error * dt
-                integral = max(-MAX_CORRECTION, min(integral, MAX_CORRECTION))  # Anti-windup
-                derivative = KD_turn * (error - last_error) / dt if dt > 0 else 0
-                correction = proportional + integral + derivative
-                correction = max(-MAX_CORRECTION, min(correction, MAX_CORRECTION))
-                last_error = error
-                
-                # Apply the correction to left and right motor speeds for turning
-                # Instead of hardcoding, use existing PWM values
-                if correction > 0:
-                    # Adjust the motor speeds based on the correction
-                    left_pwm = left_pwm  # Left motor stays at desired speed (no change)
-                    right_pwm = right_pwm - correction  # Right motor adjusts slower
-                elif correction < 0:
-                    left_pwm = left_pwm + correction  # Left motor adjusts slower
-                    right_pwm = right_pwm  # Right motor stays at desired speed (no change)
-                else:
-                    left_pwm = left_pwm  # Both motors move at the same speed
-                    right_pwm = right_pwm
+                target_right_pwm = right_pwm + correction   
 
-                # Set target PWM for turning
-                target_left_pwm = left_pwm
-                target_right_pwm = right_pwm           
+            elif current_movement == 'turn':
+                if use_PID_turn:
+                    # PID based on encoder difference
+                    error = left_count - right_count
+                    proportional = KP_turn * error
+                    integral_turn += KI_turn * error * dt
+                    integral_turn = max(-MAX_CORRECTION, min(integral_turn, MAX_CORRECTION))
+                    derivative = KD_turn * (error - last_error_turn) / dt if dt > 0 else 0
+
+                    correction = proportional + integral_turn + derivative
+                    correction = max(-MAX_CORRECTION, min(correction, MAX_CORRECTION))
+                    last_error_turn = error
+
+                    
+                    # Adjust wheels oppositely for turning
+                    target_left_pwm = left_pwm - correction
+                    target_right_pwm = right_pwm + correction
+                else:
+                    # PID disabled for turning
+                    target_left_pwm = left_pwm
+                    target_right_pwm = right_pwm
+                        
             else:
-                # Reset when stopped or turning
-                integral = 0
-                last_error = 0
-                reset_encoder()
                 target_left_pwm = left_pwm
                 target_right_pwm = right_pwm
         
@@ -352,7 +362,7 @@ def camera_stream_server():
 
 
 def pid_config_server():
-    global use_PID, KP, KI, KD
+    global use_PID, KP, KI, KD, use_PID_turn, KP_turn, KI_turn, KD_turn
     
     # Create socket for receiving PID configuration
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -367,12 +377,19 @@ def pid_config_server():
             print(f"PID config client connected")
             
             try:
-                # Receive PID constants (4 floats)
-                data = client_socket.recv(16)
-                if data and len(data) == 16:
-                    use_PID, KP, KI, KD = struct.unpack("!ffff", data)
-                    if use_PID: print(f"Updated PID constants: KP={KP}, KI={KI}, KD={KD}")
-                    else: print("The robot is not using PID.")
+                # Data format: 8 floats
+                # [use_PID, KP, KI, KD, use_PID_turn, KP_turn, KI_turn, KD_turn]
+
+                data = client_socket.recv(32)
+                if data and len(data) == 32:
+                    use_PID, KP, KI, KD, use_PID_turn, KP_turn, KI_turn, KD_turn = struct.unpack("!ffffffff", data)
+                    
+                    if use_PID: print(f"Forward PID: KP={KP}, KI={KI}, KD={KD}")
+                    else: print("Forward PID disabled")
+                    
+                    if use_PID_turn: print(f"Turning PID: KP={KP_turn}, KI={KI_turn}, KD={KD_turn}")
+                    else: print("Turning PID disabled")
+
                     
                     # Send acknowledgment (1 for success)
                     response = struct.pack("!i", 1)
@@ -473,5 +490,5 @@ def main():
         print("Cleanup complete")
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
